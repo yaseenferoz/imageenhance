@@ -288,6 +288,7 @@ function App() {
     [files],
   );
   const previewLoading = files.some((item) => item.previewState === "loading");
+  const hasRawFiles = files.some((item) => isRaw(item.file));
 
   const loadRawPreview = useCallback(async (id: string, file: File) => {
     try {
@@ -497,7 +498,11 @@ function App() {
 
   const processingLabel =
     elapsed < 8
-      ? files.length > 1 ? "Grouping room sources" : "Reading camera data"
+      ? hasRawFiles
+        ? "Decoding camera RAW data"
+        : files.length > 1
+          ? "Analysing and grouping scenes"
+          : "Analysing image and exposure"
       : elapsed < 28
         ? "Recovering exposure"
         : elapsed < 55
@@ -556,9 +561,9 @@ function App() {
               <div className="loader-copy">
                 <span className="loader-kicker">AURORA NEURAL PIPELINE</span>
                 <h2>{processingStageLabel ?? processingLabel}</h2>
-                <p>{files.length > 1 ? "Every source is enhanced first. AuroraAI then registers and combines the best areas into one result for each room." : "Your image stays in full resolution while light, colour and texture are resolved in separate passes."}</p>
+                <p>{files.length > 1 ? "Exposure brackets from each fixed viewpoint are enhanced and composited. Different viewpoints remain separate results." : "Your image stays in full resolution while light, colour and texture are resolved in separate passes."}</p>
                 <div className="loader-stages">
-                  {[(files.length > 1 ? "Group" : "Decode"), "Relight", "Balance", "Finish"].map((stage, index) => (
+                  {[(hasRawFiles ? "Decode RAW" : files.length > 1 ? "Group scenes" : "Analyse"), "Relight", "Balance", "Finish"].map((stage, index) => (
                     <div className={index < processingStage ? "done" : index === processingStage ? "active" : ""} key={stage}>
                       <span>{index < processingStage ? <Check size={11} /> : index + 1}</span>
                       <small>{stage}</small>
@@ -576,7 +581,7 @@ function App() {
             <div>
               <span className="section-index">01</span>
               <h2>Source images</h2>
-              <p>Upload exposures and viewpoints freely. AuroraAI creates one best-area composite per physical room.</p>
+              <p>Upload exposures and viewpoints freely. AuroraAI creates one best-area composite per fixed camera scene.</p>
             </div>
             {files.length > 0 && (
               <button className="text-button" type="button" onClick={clearAll}>
@@ -700,7 +705,7 @@ function App() {
                 <h2>{roomResults.length > 1 ? `Finish ${activeRoom?.label ?? "your scene"}` : "Finish your image"}</h2>
                 <p>
                   {roomResults.length > 1
-                    ? `${roomResults.length} room scenes found. Use the scene slider to open each final composite.`
+                    ? `${roomResults.length} camera scenes found. Use the scene slider to open each final composite.`
                     : "AuroraAI enhanced every source and combined only the best safely registered areas."}
                 </p>
               </div>

@@ -129,7 +129,19 @@ export async function enhanceImages(
     body: data,
   });
   const job = await readJson<EnhancementJobStart>(response);
-  onStage?.("Upload complete · queued for RAW decoding");
+  const hasRawInput = files.some((file) => {
+    const extension = file.name.toLowerCase().split(".").pop();
+    return extension !== undefined && [
+      "arw", "cr2", "cr3", "dng", "nef", "orf", "pef", "raf", "rw2", "sr2", "srf",
+    ].includes(extension);
+  });
+  onStage?.(
+    hasRawInput
+      ? "Upload complete · preparing camera RAW data"
+      : files.length > 1
+        ? "Upload complete · analysing scenes"
+        : "Upload complete · preparing image",
+  );
 
   for (let attempt = 0; attempt < 900; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 2000));
