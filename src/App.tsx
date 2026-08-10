@@ -2,6 +2,7 @@ import {
   ArrowDown,
   ArrowUpRight,
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   Contrast,
@@ -12,10 +13,8 @@ import {
   ImagePlus,
   Layers3,
   LoaderCircle,
-  Palette,
   RefreshCw,
   RotateCcw,
-  ScanSearch,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
@@ -27,6 +26,8 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import JSZip from "jszip";
+import { thumbnailUrl } from "exifr";
 import {
   type ChangeEvent,
   type CSSProperties,
@@ -40,22 +41,18 @@ import {
 } from "react";
 import {
   API_URL,
-  analyzeScene,
   checkBackend,
   createRawPreview,
   enhanceImages,
   type EnhanceResponse,
-  type SceneAnalysisResponse,
-  type SceneRegion,
+  type RoomResult,
 } from "./api";
 import {
   DEFAULT_EDITOR_SETTINGS,
   exportEditedImage,
   loadImageData,
-  loadSegmentMap,
   paintEditorCanvas,
   type EditorSettings,
-  type RegionEdits,
 } from "./editor";
 
 const RAW_EXTENSIONS = [
@@ -72,7 +69,7 @@ const RAW_EXTENSIONS = [
   ".srf",
 ];
 const ACCEPTED_TYPES = `image/*,${RAW_EXTENSIONS.join(",")}`;
-const MAX_FILES = 6;
+const MAX_FILES = 12;
 
 type PreviewState = "ready" | "loading" | "error";
 
@@ -84,10 +81,12 @@ type FileItem = {
   objectUrl: boolean;
 };
 
-type Preset = {
-  label: string;
+type DesignDirection = {
+  id: string;
+  title: string;
   description: string;
-  value: number;
+  insight: string;
+  tone: EditorSettings;
 };
 
 type ViewMode = "enhanced" | "original";
@@ -121,13 +120,29 @@ function EditorSlider({ icon, label, value, min, max, step = 1, display, onChang
   );
 }
 
-const PRESETS: Preset[] = [
-  { label: "Natural", description: "Quiet, realistic lift", value: 0.64 },
-  { label: "Balanced", description: "Detail with presence", value: 0.82 },
-  { label: "Daylight", description: "Maximum recovery", value: 1 },
+const DESIGN_DIRECTIONS: DesignDirection[] = [
+  {
+    id: "gallery-neutral",
+    title: "Gallery neutral",
+    description: "Clean whites, quieter colour and balanced architectural contrast.",
+    insight: "Best for mixed lighting and bright interiors",
+    tone: { exposure: 0.04, contrast: 5, saturation: -4, warmth: -1 },
+  },
+  {
+    id: "warm-residence",
+    title: "Warm residence",
+    description: "Soft daylight, natural timber and an inviting editorial warmth.",
+    insight: "Best for cool or shadow-heavy rooms",
+    tone: { exposure: 0.08, contrast: 3, saturation: 1, warmth: 7 },
+  },
+  {
+    id: "architectural-calm",
+    title: "Architectural calm",
+    description: "Crisper structure with restrained, cool materials and deeper definition.",
+    insight: "Best for warm casts and flat geometry",
+    tone: { exposure: 0.02, contrast: 9, saturation: -7, warmth: -4 },
+  },
 ];
-
-const OBJECT_COLORS = ["#f0eadf", "#d9c7ad", "#c8d0c3", "#8ea19d", "#b9aa9e", "#77736d"];
 
 function isRaw(file: File) {
   const name = file.name.toLowerCase();
@@ -163,24 +178,35 @@ function App() {
   const filesRef = useRef<FileItem[]>([]);
   const [files, setFiles] = useState<FileItem[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [strength, setStrength] = useState(0.82);
+  const strength = 0.82;
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
   const [processing, setProcessing] = useState(false);
+  const [processingStageLabel, setProcessingStageLabel] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<EnhanceResponse | null>(null);
+  const [activeRoomIndex, setActiveRoomIndex] = useState(0);
   const [originalUrl, setOriginalUrl] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("enhanced");
   const [editorSource, setEditorSource] = useState<ImageData | null>(null);
   const [editorLoading, setEditorLoading] = useState(false);
   const [editorSettings, setEditorSettings] = useState<EditorSettings>(DEFAULT_EDITOR_SETTINGS);
-  const [sceneAnalysis, setSceneAnalysis] = useState<SceneAnalysisResponse | null>(null);
-  const [sceneLoading, setSceneLoading] = useState(false);
-  const [sceneError, setSceneError] = useState<string | null>(null);
-  const [segmentMap, setSegmentMap] = useState<Uint8Array | null>(null);
-  const [regionEdits, setRegionEdits] = useState<RegionEdits>({});
-  const [selectedRegionId, setSelectedRegionId] = useState<number | null>(null);
+  const [activeDirectionId, setActiveDirectionId] = useState<string | null>(null);
+
+  const roomResults = result?.results ?? [];
+  const activeRoom: RoomResult | null = roomResults[activeRoomIndex] ?? null;
+  const activeImageUrl = activeRoom?.enhanced_image_url ?? result?.enhanced_image_url ?? null;
+  const activeOriginalUrl = activeRoom?.original_preview_url ?? originalUrl;
+  const activeOriginals = useMemo(() => {
+    const grouped = (activeRoom?.source_indices ?? [])
+      .map((index) => files[index])
+      .filter((item): item is FileItem => Boolean(item?.preview))
+      .map((item) => ({ url: item.preview as string, name: item.file.name }));
+    if (grouped.length) return grouped;
+    return activeOriginalUrl ? [{ url: activeOriginalUrl, name: activeRoom?.master_filename ?? "Original" }] : [];
+  }, [activeOriginalUrl, activeRoom?.master_filename, activeRoom?.source_indices, files]);
 
   useEffect(() => {
     filesRef.current = files;
@@ -211,13 +237,13 @@ function App() {
   );
 
   useEffect(() => {
-    if (!result?.enhanced_image_url) {
+    if (!activeImageUrl) {
       setEditorSource(null);
       return;
     }
     let active = true;
     setEditorLoading(true);
-    void loadImageData(result.enhanced_image_url, 1800)
+    void loadImageData(activeImageUrl, 1800)
       .then((source) => {
         if (active) setEditorSource(source);
       })
@@ -232,78 +258,30 @@ function App() {
     return () => {
       active = false;
     };
-  }, [result?.enhanced_image_url]);
-
-  useEffect(() => {
-    if (!result?.enhanced_image_url) {
-      setSceneAnalysis(null);
-      setSceneError(null);
-      setSegmentMap(null);
-      return;
-    }
-    let active = true;
-    setSceneLoading(true);
-    setSceneError(null);
-    void analyzeScene(result.enhanced_image_url)
-      .then((analysis) => {
-        if (!active) return;
-        setSceneAnalysis(analysis);
-        setRegionEdits(Object.fromEntries(
-          analysis.regions.map((region) => [
-            region.id,
-            { color: region.current_color, amount: 58, enabled: false },
-          ]),
-        ));
-        const preferred = analysis.regions.find((region) => region.label === "Wall") ?? analysis.regions[0];
-        setSelectedRegionId(preferred?.id ?? null);
-      })
-      .catch((analysisError) => {
-        if (active) {
-          setSceneError(analysisError instanceof Error ? analysisError.message : "AI scene detection failed.");
-        }
-      })
-      .finally(() => {
-        if (active) setSceneLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [result?.enhanced_image_url]);
-
-  useEffect(() => {
-    if (!sceneAnalysis?.mask_url || !editorSource) {
-      setSegmentMap(null);
-      return;
-    }
-    let active = true;
-    void loadSegmentMap(sceneAnalysis.mask_url, editorSource.width, editorSource.height)
-      .then((map) => {
-        if (active) setSegmentMap(map);
-      })
-      .catch((maskError) => {
-        if (active) setSceneError(maskError instanceof Error ? maskError.message : "Could not load AI object masks.");
-      });
-    return () => {
-      active = false;
-    };
-  }, [editorSource, sceneAnalysis?.mask_url]);
+  }, [activeImageUrl]);
 
   useEffect(() => {
     if (!editorSource || !editorCanvas.current || viewMode !== "enhanced") return;
     const frame = window.requestAnimationFrame(() => {
       if (editorCanvas.current) {
-        paintEditorCanvas(editorCanvas.current, editorSource, editorSettings, segmentMap, regionEdits);
+        paintEditorCanvas(editorCanvas.current, editorSource, editorSettings);
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [editorSource, editorSettings, segmentMap, regionEdits, viewMode]);
-
-  const activeRegion: SceneRegion | null = useMemo(
-    () => sceneAnalysis?.regions.find((region) => region.id === selectedRegionId) ?? null,
-    [sceneAnalysis, selectedRegionId],
-  );
-  const activeRegionEdit = activeRegion ? regionEdits[activeRegion.id] : undefined;
-  const editedRegionCount = Object.values(regionEdits).filter((edit) => edit.enabled).length;
+  }, [editorSource, editorSettings, viewMode]);
+  const recommendedDirectionId = useMemo(() => {
+    const colourCast = activeRoom?.colour_cast_ratio ?? result?.colour_cast_ratio ?? 1;
+    const saturation = activeRoom?.mean_saturation ?? result?.mean_saturation ?? 0;
+    const median = activeRoom?.median_luminance ?? result?.median_luminance ?? 0.5;
+    const dark = activeRoom?.dark_fraction ?? result?.dark_fraction ?? 0;
+    if (colourCast > 1.18 || saturation > 82) {
+      return "architectural-calm";
+    }
+    if (median < 0.42 || dark > 0.32) {
+      return "warm-residence";
+    }
+    return "gallery-neutral";
+  }, [activeRoom, result?.colour_cast_ratio, result?.dark_fraction, result?.mean_saturation, result?.median_luminance]);
 
   const totalSize = useMemo(
     () => files.reduce((sum, item) => sum + item.file.size, 0),
@@ -313,11 +291,15 @@ function App() {
 
   const loadRawPreview = useCallback(async (id: string, file: File) => {
     try {
-      const preview = await createRawPreview(file);
+      // ARW and most camera RAW files commonly contain a browser-displayable
+      // JPEG thumbnail. Extract it locally first so choosing files does not
+      // immediately upload the full RAW merely to draw an upload card.
+      const localPreview = await thumbnailUrl(file).catch(() => undefined);
+      const preview = localPreview ?? await createRawPreview(file);
       setFiles((current) =>
         current.map((item) =>
           item.id === id
-            ? { ...item, preview, previewState: "ready" }
+            ? { ...item, preview, previewState: "ready", objectUrl: Boolean(localPreview) }
             : item,
         ),
       );
@@ -339,6 +321,7 @@ function App() {
     (incoming: File[]) => {
       setError(null);
       setResult(null);
+      setActiveRoomIndex(0);
       const supported = incoming.filter(isSupported);
       if (supported.length !== incoming.length) {
         setError("One or more files were not a supported image or camera RAW format.");
@@ -375,6 +358,7 @@ function App() {
     filesRef.current = filesRef.current.filter((item) => item.id !== id);
     setFiles(filesRef.current);
     setResult(null);
+    setActiveRoomIndex(0);
     setOriginalUrl(null);
     setError(null);
   };
@@ -386,15 +370,12 @@ function App() {
     filesRef.current = [];
     setFiles([]);
     setResult(null);
+    setActiveRoomIndex(0);
     setOriginalUrl(null);
     setError(null);
     setViewMode("enhanced");
     setEditorSettings(DEFAULT_EDITOR_SETTINGS);
-    setSceneAnalysis(null);
-    setSceneError(null);
-    setSegmentMap(null);
-    setRegionEdits({});
-    setSelectedRegionId(null);
+    setActiveDirectionId(null);
     if (fileInput.current) fileInput.current.value = "";
   };
 
@@ -402,20 +383,20 @@ function App() {
     if (!files.length || previewLoading) return;
     setError(null);
     setResult(null);
-    setSceneAnalysis(null);
-    setSceneError(null);
-    setSegmentMap(null);
-    setRegionEdits({});
-    setSelectedRegionId(null);
+    setActiveRoomIndex(0);
+    setActiveDirectionId(null);
+    setProcessingStageLabel("Uploading source files");
     setProcessing(true);
 
     try {
       const response = await enhanceImages(
         files.map((item) => item.file),
         strength,
+        setProcessingStageLabel,
       );
       setOriginalUrl(files[0].preview || response.original_preview_url || null);
       setResult(response);
+      setActiveRoomIndex(0);
       setViewMode("enhanced");
       setEditorSettings(DEFAULT_EDITOR_SETTINGS);
       window.setTimeout(
@@ -431,18 +412,19 @@ function App() {
       setBackendOnline(await checkBackend());
     } finally {
       setProcessing(false);
+      setProcessingStageLabel(null);
     }
   };
 
   const downloadResult = async () => {
-    if (!result?.enhanced_image_url) return;
+    if (!activeImageUrl) return;
     setDownloading(true);
     try {
       const blob = await exportEditedImage(
-        result.enhanced_image_url,
+        activeImageUrl,
         editorSettings,
-        sceneAnalysis?.mask_url ?? null,
-        regionEdits,
+        null,
+        {},
       );
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
@@ -459,38 +441,69 @@ function App() {
     }
   };
 
+  const downloadAllResults = async () => {
+    if (!roomResults.length || downloadingAll) return;
+    setDownloadingAll(true);
+    try {
+      const archive = new JSZip();
+      await Promise.all(
+        roomResults.map(async (room, index) => {
+          const response = await fetch(room.enhanced_image_url);
+          if (!response.ok) throw new Error(`Could not download ${room.label}.`);
+          archive.file(`auroraai-scene-${String(index + 1).padStart(2, "0")}.jpg`, await response.blob());
+        }),
+      );
+      const blob = await archive.generateAsync({ type: "blob", compression: "DEFLATE" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `auroraai-all-scenes-${Date.now()}.zip`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (downloadError) {
+      setError(downloadError instanceof Error ? downloadError.message : "Could not download all scene images.");
+    } finally {
+      setDownloadingAll(false);
+    }
+  };
+
   const updateEditor = <Key extends keyof EditorSettings>(key: Key, value: EditorSettings[Key]) => {
     setEditorSettings((current) => ({ ...current, [key]: value }));
+    setActiveDirectionId(null);
     setViewMode("enhanced");
   };
 
   const resetEditor = () => {
     setEditorSettings(DEFAULT_EDITOR_SETTINGS);
-    setRegionEdits(Object.fromEntries(
-      (sceneAnalysis?.regions ?? []).map((region) => [
-        region.id,
-        { color: region.current_color, amount: 58, enabled: false },
-      ]),
-    ));
+    setViewMode("enhanced");
+    setActiveDirectionId(null);
+  };
+
+  const applyDesignDirection = (direction: DesignDirection) => {
+    setEditorSettings(direction.tone);
+    setActiveDirectionId(direction.id);
     setViewMode("enhanced");
   };
 
-  const updateRegionEdit = (regionId: number, patch: Partial<RegionEdits[number]>) => {
-    setRegionEdits((current) => ({
-      ...current,
-      [regionId]: { ...current[regionId], ...patch },
-    }));
+  const selectRoom = (index: number) => {
+    if (index < 0 || index >= roomResults.length || index === activeRoomIndex) return;
+    setActiveRoomIndex(index);
     setViewMode("enhanced");
+    setEditorSettings(DEFAULT_EDITOR_SETTINGS);
+    setActiveDirectionId(null);
   };
 
   const processingLabel =
     elapsed < 8
-      ? "Reading camera data"
+      ? files.length > 1 ? "Grouping room sources" : "Reading camera data"
       : elapsed < 28
         ? "Recovering exposure"
         : elapsed < 55
           ? "Balancing light and colour"
           : "Finishing detail and texture";
+  const processingStage = elapsed < 8 ? 0 : elapsed < 28 ? 1 : elapsed < 55 ? 2 : 3;
 
   return (
     <div className="app-shell">
@@ -517,11 +530,12 @@ function App() {
 
       <main id="top">
         <section className="hero">
-          <div className="eyebrow"><span /> AI RELIGHTING · RAW READY</div>
-          <h1>Light, <em>resolved.</em></h1>
+          <div className="hero-aurora" aria-hidden="true"><i /><i /><i /></div>
+          <div className="eyebrow"><span /> AURORA IMAGING ENGINE · RAW READY</div>
+          <h1>Turn difficult light<br /><em>into atmosphere.</em></h1>
           <p>
-            Recover shadow detail, calm harsh highlights, and finish difficult
-            frames with a natural, camera-aware grade.
+            A considered AI imaging studio for interiors—recovering natural light,
+            protecting material detail, and revealing only edits it can trust.
           </p>
           <div className="hero-proof">
             <span><ShieldCheck size={15} /> Local-quality processing</span>
@@ -530,12 +544,39 @@ function App() {
           </div>
         </section>
 
+        {processing && (
+          <div className="processing-veil" role="status" aria-live="polite">
+            <div className="aurora-loader-card">
+              <div className="loader-art" aria-hidden="true">
+                <span className="loader-halo halo-one" />
+                <span className="loader-halo halo-two" />
+                <span className="loader-core"><Sparkles size={24} /></span>
+                <span className="loader-scan" />
+              </div>
+              <div className="loader-copy">
+                <span className="loader-kicker">AURORA NEURAL PIPELINE</span>
+                <h2>{processingStageLabel ?? processingLabel}</h2>
+                <p>{files.length > 1 ? "Every source is enhanced first. AuroraAI then registers and combines the best areas into one result for each room." : "Your image stays in full resolution while light, colour and texture are resolved in separate passes."}</p>
+                <div className="loader-stages">
+                  {[(files.length > 1 ? "Group" : "Decode"), "Relight", "Balance", "Finish"].map((stage, index) => (
+                    <div className={index < processingStage ? "done" : index === processingStage ? "active" : ""} key={stage}>
+                      <span>{index < processingStage ? <Check size={11} /> : index + 1}</span>
+                      <small>{stage}</small>
+                    </div>
+                  ))}
+                </div>
+                <div className="loader-meta"><span>{formatTime(elapsed)} elapsed</span><span>Keep this tab open</span></div>
+              </div>
+            </div>
+          </div>
+        )}
+
         <section className="studio-panel" aria-label="Enhancement studio">
           <div className="studio-heading">
             <div>
               <span className="section-index">01</span>
               <h2>Source images</h2>
-              <p>Use one image, or add aligned exposures for richer recovery.</p>
+              <p>Upload exposures and viewpoints freely. AuroraAI creates one best-area composite per physical room.</p>
             </div>
             {files.length > 0 && (
               <button className="text-button" type="button" onClick={clearAll}>
@@ -599,7 +640,6 @@ function App() {
                       ) : (
                         <FileImage size={24} />
                       )}
-                      {index === 0 && <span className="anchor-badge">Anchor</span>}
                       {isRaw(item.file) && <span className="raw-badge">RAW</span>}
                     </div>
                     <div className="file-info">
@@ -622,46 +662,7 @@ function App() {
             </div>
           )}
 
-          <div className="control-deck">
-            <div className="studio-heading compact">
-              <div>
-                <span className="section-index">02</span>
-                <h2>Choose the finish</h2>
-                <p>The engine still protects images that need little correction.</p>
-              </div>
-              <div className="strength-readout">
-                <strong>{Math.round(strength * 100)}</strong><span>%</span>
-              </div>
-            </div>
-
-            <div className="preset-grid">
-              {PRESETS.map((preset) => (
-                <button
-                  className={Math.abs(strength - preset.value) < 0.01 ? "active" : ""}
-                  type="button"
-                  key={preset.label}
-                  onClick={() => setStrength(preset.value)}
-                >
-                  <span className="preset-check"><Check size={13} /></span>
-                  <strong>{preset.label}</strong>
-                  <small>{preset.description}</small>
-                </button>
-              ))}
-            </div>
-            <label className="strength-slider">
-              <span>Relighting intensity</span>
-              <input
-                type="range"
-                min="0.35"
-                max="1"
-                step="0.01"
-                value={strength}
-                onChange={(event) => setStrength(Number(event.target.value))}
-                style={{ "--value": `${((strength - 0.35) / 0.65) * 100}%` } as CSSProperties}
-              />
-              <span>35</span><span>100</span>
-            </label>
-
+          <div className="control-deck compact-action-deck">
             {error && (
               <div className="error-banner" role="alert">
                 <CircleAlert size={18} /><span>{error}</span>
@@ -677,7 +678,7 @@ function App() {
             >
               {processing ? <LoaderCircle className="spin" size={19} /> : <WandSparkles size={19} />}
               <span>
-                <strong>{processing ? processingLabel : "Enhance with AuroraAI"}</strong>
+                <strong>{processing ? (processingStageLabel ?? processingLabel) : "Enhance with AuroraAI"}</strong>
                 <small>
                   {processing
                     ? `${formatTime(elapsed)} elapsed · keep this tab open`
@@ -691,13 +692,17 @@ function App() {
           </div>
         </section>
 
-        {result?.enhanced_image_url && originalUrl && (
+        {activeImageUrl && activeOriginalUrl && (
           <section className="result-section" id="result">
             <div className="result-heading">
               <div>
-                <span className="section-index">03</span>
-                <h2>Finish your image</h2>
-                <p>AI maps the room automatically. Choose any detected surface or object to recolour it.</p>
+                <span className="section-index">02</span>
+                <h2>{roomResults.length > 1 ? `Finish ${activeRoom?.label ?? "your scene"}` : "Finish your image"}</h2>
+                <p>
+                  {roomResults.length > 1
+                    ? `${roomResults.length} room scenes found. Use the scene slider to open each final composite.`
+                    : "AuroraAI enhanced every source and combined only the best safely registered areas."}
+                </p>
               </div>
               <div className="view-switch" aria-label="Preview version">
                 <button
@@ -717,33 +722,114 @@ function App() {
               </div>
             </div>
 
+            {roomResults.length > 1 && (
+              <div className="room-carousel" aria-label="Completed scene results">
+                <button
+                  className="room-carousel-arrow"
+                  type="button"
+                  disabled={activeRoomIndex === 0}
+                  onClick={() => selectRoom(activeRoomIndex - 1)}
+                  aria-label="Previous scene"
+                >
+                  <ChevronLeft size={18} />
+                </button>
+                <div className="room-carousel-track">
+                  {roomResults.map((room, index) => (
+                    <button
+                      type="button"
+                      className={`room-result-tab ${index === activeRoomIndex ? "active" : ""}`}
+                      key={room.room_id}
+                      onClick={() => selectRoom(index)}
+                    >
+                      <span className="room-tab-index">{String(index + 1).padStart(2, "0")}</span>
+                      <span>
+                        <strong>{room.label}</strong>
+                        <small>{room.input_frames} {room.input_frames === 1 ? "source" : "room sources"} · final composite</small>
+                      </span>
+                      {index === activeRoomIndex && <Sparkles size={15} />}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  className="room-carousel-arrow"
+                  type="button"
+                  disabled={activeRoomIndex === roomResults.length - 1}
+                  onClick={() => selectRoom(activeRoomIndex + 1)}
+                  aria-label="Next scene"
+                >
+                  <ChevronRight size={18} />
+                </button>
+              </div>
+            )}
+
             <div className="finishing-workspace">
               <div className="editor-stage">
                 {viewMode === "original" ? (
-                  <img src={originalUrl} alt="Original image" />
+                  <div className={`original-grid ${activeOriginals.length === 1 ? "single" : ""}`}>
+                    {activeOriginals.map((source, index) => (
+                      <figure key={`${source.name}-${index}`}>
+                        <img src={source.url} alt={`${activeRoom?.label ?? "Scene"} original ${index + 1}`} />
+                        <figcaption><span>Source {String(index + 1).padStart(2, "0")}</span><strong>{source.name}</strong></figcaption>
+                      </figure>
+                    ))}
+                  </div>
                 ) : (
                   <>
                     <canvas ref={editorCanvas} aria-label="Enhanced image editor preview" />
                     {editorLoading && (
                       <div className="editor-loading"><LoaderCircle className="spin" size={22} /> Preparing editor</div>
                     )}
-                    {sceneLoading && (
-                      <div className="scene-scanning"><ScanSearch size={18} /> AI mapping walls and furniture</div>
-                    )}
                   </>
                 )}
                 <span className="editor-version-label">
-                  {viewMode === "original" ? "Original" : editedRegionCount ? `Enhanced · ${editedRegionCount} AI edits` : "Enhanced"}
+                  {viewMode === "original" ? `${activeOriginals.length} original ${activeOriginals.length === 1 ? "source" : "sources"}` : "Enhanced"}
                 </span>
               </div>
 
               <aside className="finish-panel">
                 <div className="finish-panel-heading">
-                  <span><SlidersHorizontal size={16} /></span>
-                  <div><strong>Fine tune</strong><small>Subtle finishing controls</small></div>
+                  <span><WandSparkles size={16} /></span>
+                  <div><strong>Aurora directions</strong><small>One decision, coordinated edits</small></div>
                   <button type="button" onClick={resetEditor} aria-label="Reset all edits"><RotateCcw size={15} /></button>
                 </div>
 
+                <p className="directions-intro">Choose a coordinated whole-image finish, or tune it directly below.</p>
+
+                <div className="direction-list">
+                    {[...DESIGN_DIRECTIONS]
+                      .sort((a, b) => Number(b.id === recommendedDirectionId) - Number(a.id === recommendedDirectionId))
+                      .map((direction, index) => {
+                        const isRecommended = direction.id === recommendedDirectionId;
+                        const isActive = direction.id === activeDirectionId;
+                        return (
+                          <button
+                            className={`direction-card ${isRecommended ? "recommended" : ""} ${isActive ? "active" : ""}`}
+                            type="button"
+                            key={direction.id}
+                            onClick={() => applyDesignDirection(direction)}
+                          >
+                            <span className="direction-number">0{index + 1}</span>
+                            <span className="direction-copy">
+                              <span className="direction-title-row">
+                                <strong>{direction.title}</strong>
+                                {isRecommended && <small>AI PICK</small>}
+                              </span>
+                              <span>{direction.description}</span>
+                              <em>{direction.insight} · whole-image finish</em>
+                            </span>
+                            <span className="direction-action">{isActive ? <Check size={14} /> : <ChevronRight size={14} />}</span>
+                          </button>
+                        );
+                      })}
+                </div>
+
+                <details className="advanced-editor" open>
+                  <summary>
+                    <span><SlidersHorizontal size={15} /></span>
+                    <span><strong>Advanced controls</strong><small>Exposure, contrast, colour and warmth</small></span>
+                    <ChevronRight className="advanced-chevron" size={15} />
+                  </summary>
+                  <div className="advanced-editor-body">
                 <div className="editor-controls">
                   <EditorSlider
                     icon={<SunMedium size={15} />}
@@ -784,93 +870,33 @@ function App() {
                   />
                 </div>
 
-                <div className="ai-object-tool">
-                  <div className="wall-tool-title">
-                    <span><ScanSearch size={16} /></span>
-                    <div><strong>AI room map</strong><small>No manual selection required</small></div>
                   </div>
-                  {sceneLoading ? (
-                    <div className="ai-map-state"><LoaderCircle className="spin" size={18} /><span>Detecting editable objects…</span></div>
-                  ) : sceneError ? (
-                    <div className="ai-map-error"><CircleAlert size={16} /><span>{sceneError}</span></div>
-                  ) : sceneAnalysis?.regions.length ? (
-                    <>
-                      <div className="detected-regions" aria-label="AI detected editable objects">
-                        {sceneAnalysis.regions.map((region) => (
-                          <button
-                            key={region.id}
-                            type="button"
-                            className={`${selectedRegionId === region.id ? "active" : ""} ${regionEdits[region.id]?.enabled ? "edited" : ""}`}
-                            onClick={() => setSelectedRegionId(region.id)}
-                          >
-                            <span className="region-colour" style={{ backgroundColor: regionEdits[region.id]?.color ?? region.current_color }} />
-                            <span>{region.label}</span>
-                            <small>{Math.max(1, Math.round(region.area_fraction * 100))}%</small>
-                          </button>
-                        ))}
-                      </div>
-                      {activeRegion && activeRegionEdit && (
-                        <div className="region-colour-editor">
-                          <div className="region-editor-title">
-                            <span>Change {activeRegion.label}</span>
-                            {activeRegionEdit.enabled && (
-                              <button type="button" onClick={() => updateRegionEdit(activeRegion.id, { enabled: false })}>Reset colour</button>
-                            )}
-                          </div>
-                          <div className="colour-swatches">
-                            {OBJECT_COLORS.map((color) => (
-                              <button
-                                key={color}
-                                type="button"
-                                className={activeRegionEdit.enabled && activeRegionEdit.color === color ? "active" : ""}
-                                style={{ backgroundColor: color }}
-                                onClick={() => updateRegionEdit(activeRegion.id, { color, enabled: true })}
-                                aria-label={`Change ${activeRegion.label} to ${color}`}
-                              />
-                            ))}
-                            <label className="custom-colour" title={`Custom colour for ${activeRegion.label}`}>
-                              <input
-                                type="color"
-                                value={activeRegionEdit.color}
-                                onChange={(event) => updateRegionEdit(activeRegion.id, { color: event.target.value, enabled: true })}
-                              />
-                              <span>+</span>
-                            </label>
-                          </div>
-                          <EditorSlider
-                            icon={<Palette size={14} />}
-                            label="Colour strength"
-                            value={activeRegionEdit.amount}
-                            min={10}
-                            max={85}
-                            display={`${activeRegionEdit.amount}%`}
-                            onChange={(amount) => updateRegionEdit(activeRegion.id, { amount, enabled: true })}
-                          />
-                        </div>
-                      )}
-                      <p>{sceneAnalysis.regions.length} editable regions found automatically. Pick a detected item above—never paint a mask by hand.</p>
-                    </>
-                  ) : (
-                    <div className="ai-map-state"><span>No editable room elements were confidently detected.</span></div>
-                  )}
-                </div>
+                </details>
+
               </aside>
             </div>
 
             <div className="result-footer">
               <div className="diagnostics">
-                <div><span>Engine</span><strong>{humanizeEngine(result.engine)}</strong></div>
-                <div><span>Source</span><strong>{result.raw_input ? "Camera RAW" : "Standard image"}</strong></div>
-                <div><span>Frames</span><strong>{result.input_frames ?? files.length}</strong></div>
-                <div><span>Strength</span><strong>{Math.round((result.strength ?? strength) * 100)}%</strong></div>
+                <div><span>Engine</span><strong>{humanizeEngine(activeRoom?.engine ?? result?.engine)}</strong></div>
+                <div><span>Source</span><strong>{(activeRoom?.raw_input ?? result?.raw_input) ? "Camera RAW" : "Standard image"}</strong></div>
+                <div><span>Scene sources</span><strong>{activeRoom?.input_frames ?? result?.input_frames ?? files.length}</strong></div>
+                <div><span>Fusion</span><strong>{(activeRoom?.fused_frames ?? result?.fused_frames ?? 1) > 1 ? `${activeRoom?.fused_frames ?? result?.fused_frames} registered` : "Canonical view"}</strong></div>
+                <div><span>Strength</span><strong>{Math.round((result?.strength ?? strength) * 100)}%</strong></div>
               </div>
               <div className="result-actions">
                 <button className="secondary-button" type="button" onClick={clearAll}>
                   <RefreshCw size={17} /> New image
                 </button>
+                {roomResults.length > 1 && (
+                  <button className="secondary-button" type="button" onClick={() => void downloadAllResults()} disabled={downloadingAll}>
+                    {downloadingAll ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />}
+                    {downloadingAll ? "Building ZIP…" : "Download all"}
+                  </button>
+                )}
                 <button className="download-button" type="button" onClick={() => void downloadResult()} disabled={downloading}>
                   {downloading ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />}
-                  {downloading ? "Rendering full quality…" : "Download with edits"}
+                  {downloading ? "Rendering full quality…" : "Download this image"}
                 </button>
               </div>
             </div>

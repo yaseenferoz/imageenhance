@@ -20,26 +20,36 @@ export type EnhanceResponse = {
   frame_fusion?: string;
   raw_input?: boolean;
   raw_processing?: string;
+  fused_frames?: number;
+  room_groups?: number;
+  grouping_model?: string;
+  results?: RoomResult[];
 };
 
-export type SceneRegion = {
-  id: number;
+export type RoomResult = {
+  room_id: string;
   label: string;
-  source_label: string;
-  kind: "surface" | "object";
-  area_fraction: number;
-  current_color: string;
-};
-
-export type SceneAnalysisResponse = {
-  status: "success" | "error";
-  mask_url: string;
-  regions: SceneRegion[];
-  model: string;
-  device: string;
-  detected_regions: number;
-  image_width: number;
-  image_height: number;
+  filename: string;
+  image: string;
+  enhanced_image_url: string;
+  original_preview_url: string;
+  input_frames: number;
+  fused_frames: number;
+  frame_fusion?: string;
+  engine?: string;
+  applied?: boolean;
+  raw_input?: boolean;
+  raw_processing?: string;
+  median_luminance?: number;
+  dark_fraction?: number;
+  colour_cast_ratio?: number;
+  mean_saturation?: number;
+  relighting_amount?: number;
+  room_confidence: number;
+  source_indices: number[];
+  source_filenames: string[];
+  master_filename: string;
+  selection_strategy: "best-master-view" | "canonical-view-best-regions";
 };
 
 type PreviewResponse = {
@@ -47,6 +57,19 @@ type PreviewResponse = {
   preview_url?: string;
   message?: string;
   detail?: string;
+};
+
+type EnhancementJobStart = {
+  status: "queued";
+  job_id: string;
+};
+
+type EnhancementJobStatus = {
+  status: "queued" | "processing" | "completed" | "failed";
+  job_id: string;
+  stage?: string;
+  detail?: string;
+  result?: EnhanceResponse;
 };
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -95,28 +118,32 @@ export async function createRawPreview(file: File): Promise<string> {
 export async function enhanceImages(
   files: File[],
   strength: number,
+  onStage?: (stage: string) => void,
 ): Promise<EnhanceResponse> {
   const data = new FormData();
   files.forEach((file) => data.append("files", file));
   data.append("strength", String(strength));
 
-  const response = await fetch(`${API_URL}/enhance`, {
+  const response = await fetch(`${API_URL}/enhance-jobs`, {
     method: "POST",
     body: data,
   });
-  return readJson<EnhanceResponse>(response);
-}
+  const job = await readJson<EnhancementJobStart>(response);
+  onStage?.("Upload complete · queued for RAW decoding");
 
-export async function analyzeScene(imageUrl: string): Promise<SceneAnalysisResponse> {
-  const imageResponse = await fetch(imageUrl);
-  if (!imageResponse.ok) throw new Error("Could not prepare the enhanced image for AI scene detection.");
-  const imageBlob = await imageResponse.blob();
-  const data = new FormData();
-  data.append("file", new File([imageBlob], "enhanced-scene.jpg", { type: imageBlob.type || "image/jpeg" }));
+  for (let attempt = 0; attempt < 900; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    const statusResponse = await fetch(
+      `${API_URL}/enhance-jobs/${job.job_id}?t=${Date.now()}`,
+      { cache: "no-store" },
+    );
+    const status = await readJson<EnhancementJobStatus>(statusResponse);
+    if (status.stage) onStage?.(status.stage);
+    if (status.status === "completed" && status.result) return status.result;
+    if (status.status === "failed") {
+      throw new Error(status.detail || "Image enhancement failed.");
+    }
+  }
 
-  const response = await fetch(`${API_URL}/analyze-scene`, {
-    method: "POST",
-    body: data,
-  });
-  return readJson<SceneAnalysisResponse>(response);
+  throw new Error("Enhancement is still running after 30 minutes. Please try again.");
 }
