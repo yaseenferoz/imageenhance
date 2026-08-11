@@ -13,6 +13,7 @@ import {
   ImagePlus,
   Layers3,
   LoaderCircle,
+  LogIn,
   RefreshCw,
   RotateCcw,
   ShieldCheck,
@@ -42,11 +43,21 @@ import {
 import {
   API_URL,
   checkBackend,
+  claimEnhancementJob,
   createRawPreview,
   enhanceImages,
   type EnhanceResponse,
   type RoomResult,
 } from "./api";
+import { AccountPanel } from "./AccountPanel";
+import {
+  authConfigured,
+  loadAccountJobs,
+  signInWithGoogle,
+  supabase,
+  type AccountJob,
+  type AuroraSession,
+} from "./auth";
 import {
   DEFAULT_EDITOR_SETTINGS,
   exportEditedImage,
@@ -182,6 +193,7 @@ function App() {
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
   const [processing, setProcessing] = useState(false);
   const [processingStageLabel, setProcessingStageLabel] = useState<string | null>(null);
+  const [completionVisible, setCompletionVisible] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<EnhanceResponse | null>(null);
@@ -194,6 +206,13 @@ function App() {
   const [editorLoading, setEditorLoading] = useState(false);
   const [editorSettings, setEditorSettings] = useState<EditorSettings>(DEFAULT_EDITOR_SETTINGS);
   const [activeDirectionId, setActiveDirectionId] = useState<string | null>(null);
+  const [session, setSession] = useState<AuroraSession | null>(null);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [accountJobs, setAccountJobs] = useState<AccountJob[]>([]);
+  const [accountJobsLoading, setAccountJobsLoading] = useState(false);
+  const [pendingJobId, setPendingJobId] = useState<string | null>(() =>
+    window.sessionStorage.getItem("auroraai-pending-job"),
+  );
 
   const roomResults = result?.results ?? [];
   const activeRoom: RoomResult | null = roomResults[activeRoomIndex] ?? null;
@@ -214,6 +233,43 @@ function App() {
 
   useEffect(() => {
     void checkBackend().then(setBackendOnline);
+  }, []);
+
+  useEffect(() => {
+    if (!session || !pendingJobId) return;
+    let active = true;
+    setAccountJobsLoading(true);
+    void claimEnhancementJob(pendingJobId, session.access_token)
+      .then((claimedResult) => {
+        if (!active) return;
+        setResult(claimedResult);
+        setOriginalUrl(claimedResult.original_preview_url ?? null);
+        setActiveRoomIndex(0);
+        setViewMode("enhanced");
+        setEditorSettings(DEFAULT_EDITOR_SETTINGS);
+        window.sessionStorage.removeItem("auroraai-pending-job");
+        setPendingJobId(null);
+        setAccountOpen(false);
+        setCompletionVisible(true);
+        void loadAccountJobs().then(setAccountJobs).catch(() => undefined);
+      })
+      .catch((claimError) => {
+        if (active) setError(claimError instanceof Error ? claimError.message : "Could not unlock the enhancement.");
+      })
+      .finally(() => {
+        if (active) setAccountJobsLoading(false);
+      });
+    return () => { active = false; };
+  }, [pendingJobId, session]);
+
+  useEffect(() => {
+    if (!supabase) return;
+    void supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+      if (!nextSession) setAccountJobs([]);
+    });
+    return () => data.subscription.unsubscribe();
   }, []);
 
   useEffect(() => {
@@ -320,7 +376,9 @@ function App() {
 
   const addFiles = useCallback(
     (incoming: File[]) => {
+      if (processing) return;
       setError(null);
+      setCompletionVisible(false);
       setResult(null);
       setActiveRoomIndex(0);
       const supported = incoming.filter(isSupported);
@@ -350,7 +408,7 @@ function App() {
         .filter((item) => isRaw(item.file))
         .forEach((item) => void loadRawPreview(item.id, item.file));
     },
-    [loadRawPreview],
+    [loadRawPreview, processing],
   );
 
   const removeFile = (id: string) => {
@@ -362,6 +420,7 @@ function App() {
     setActiveRoomIndex(0);
     setOriginalUrl(null);
     setError(null);
+    setCompletionVisible(false);
   };
 
   const clearAll = () => {
@@ -374,6 +433,7 @@ function App() {
     setActiveRoomIndex(0);
     setOriginalUrl(null);
     setError(null);
+    setCompletionVisible(false);
     setViewMode("enhanced");
     setEditorSettings(DEFAULT_EDITOR_SETTINGS);
     setActiveDirectionId(null);
@@ -386,6 +446,7 @@ function App() {
     setResult(null);
     setActiveRoomIndex(0);
     setActiveDirectionId(null);
+    setCompletionVisible(false);
     setProcessingStageLabel("Uploading source files");
     setProcessing(true);
 
@@ -394,16 +455,22 @@ function App() {
         files.map((item) => item.file),
         strength,
         setProcessingStageLabel,
+        session?.access_token,
       );
+      if (response.status === "locked") {
+        window.sessionStorage.setItem("auroraai-pending-job", response.job_id);
+        setPendingJobId(response.job_id);
+        setAccountOpen(true);
+        setCompletionVisible(false);
+        return;
+      }
       setOriginalUrl(files[0].preview || response.original_preview_url || null);
       setResult(response);
       setActiveRoomIndex(0);
       setViewMode("enhanced");
       setEditorSettings(DEFAULT_EDITOR_SETTINGS);
-      window.setTimeout(
-        () => document.getElementById("result")?.scrollIntoView({ behavior: "smooth" }),
-        100,
-      );
+      setCompletionVisible(true);
+      if (session) void refreshAccountJobs();
     } catch (enhanceError) {
       setError(
         enhanceError instanceof Error
@@ -415,6 +482,51 @@ function App() {
       setProcessing(false);
       setProcessingStageLabel(null);
     }
+  };
+
+  const refreshAccountJobs = useCallback(async () => {
+    if (!session) return;
+    setAccountJobsLoading(true);
+    try {
+      setAccountJobs(await loadAccountJobs());
+    } catch (accountError) {
+      setError(accountError instanceof Error ? accountError.message : "Could not load account activity.");
+    } finally {
+      setAccountJobsLoading(false);
+    }
+  }, [session]);
+
+  useEffect(() => {
+    if (!session || (!accountOpen && !processing)) return;
+    void refreshAccountJobs();
+    const timer = window.setInterval(() => void refreshAccountJobs(), processing ? 3000 : 8000);
+    return () => window.clearInterval(timer);
+  }, [accountOpen, processing, refreshAccountJobs, session]);
+
+  const beginSignIn = async () => {
+    try {
+      await signInWithGoogle();
+    } catch (authError) {
+      setError(authError instanceof Error ? authError.message : "Could not start sign-in.");
+    }
+  };
+
+  const signOut = async () => {
+    await supabase?.auth.signOut();
+    setResult(null);
+    setOriginalUrl(null);
+    setAccountOpen(false);
+  };
+
+  const openAccountResult = (job: AccountJob) => {
+    if (!job.result) return;
+    setResult(job.result);
+    setOriginalUrl(job.result.original_preview_url ?? null);
+    setActiveRoomIndex(0);
+    setViewMode("enhanced");
+    setEditorSettings(DEFAULT_EDITOR_SETTINGS);
+    setAccountOpen(false);
+    window.setTimeout(() => document.getElementById("result")?.scrollIntoView({ behavior: "smooth" }), 80);
   };
 
   const downloadResult = async () => {
@@ -509,6 +621,8 @@ function App() {
           ? "Balancing light and colour"
           : "Finishing detail and texture";
   const processingStage = elapsed < 8 ? 0 : elapsed < 28 ? 1 : elapsed < 55 ? 2 : 3;
+  const visibleProcessingLabel =
+    elapsed < 8 && processingStageLabel ? processingStageLabel : processingLabel;
 
   return (
     <div className="app-shell">
@@ -530,8 +644,28 @@ function App() {
           <a className="docs-link" href={`${API_URL}/docs`} target="_blank" rel="noreferrer">
             API <ArrowUpRight size={14} />
           </a>
+          <button className={`account-trigger ${session ? "signed-in" : ""}`} type="button" onClick={() => setAccountOpen(true)}>
+            {session?.user.user_metadata?.avatar_url ? (
+              <img src={session.user.user_metadata.avatar_url as string} alt="" />
+            ) : <LogIn size={14} />}
+            <span>{session ? "My account" : "Sign in"}</span>
+          </button>
         </div>
       </header>
+
+      <AccountPanel
+        open={accountOpen}
+        configured={authConfigured}
+        user={session?.user ?? null}
+        jobs={accountJobs}
+        loading={accountJobsLoading}
+        pendingEnhancement={Boolean(pendingJobId)}
+        onClose={() => setAccountOpen(false)}
+        onGoogle={() => void beginSignIn()}
+        onRefresh={() => void refreshAccountJobs()}
+        onSignOut={() => void signOut()}
+        onOpenResult={openAccountResult}
+      />
 
       <main id="top">
         <section className="hero">
@@ -549,31 +683,45 @@ function App() {
           </div>
         </section>
 
-        {processing && (
-          <div className="processing-veil" role="status" aria-live="polite">
-            <div className="aurora-loader-card">
-              <div className="loader-art" aria-hidden="true">
-                <span className="loader-halo halo-one" />
-                <span className="loader-halo halo-two" />
-                <span className="loader-core"><Sparkles size={24} /></span>
-                <span className="loader-scan" />
-              </div>
-              <div className="loader-copy">
-                <span className="loader-kicker">AURORA NEURAL PIPELINE</span>
-                <h2>{processingStageLabel ?? processingLabel}</h2>
-                <p>{files.length > 1 ? "Exposure brackets from each fixed viewpoint are enhanced and composited. Different viewpoints remain separate results." : "Your image stays in full resolution while light, colour and texture are resolved in separate passes."}</p>
-                <div className="loader-stages">
-                  {[(hasRawFiles ? "Decode RAW" : files.length > 1 ? "Group scenes" : "Analyse"), "Relight", "Balance", "Finish"].map((stage, index) => (
-                    <div className={index < processingStage ? "done" : index === processingStage ? "active" : ""} key={stage}>
-                      <span>{index < processingStage ? <Check size={11} /> : index + 1}</span>
-                      <small>{stage}</small>
-                    </div>
-                  ))}
-                </div>
-                <div className="loader-meta"><span>{formatTime(elapsed)} elapsed</span><span>Keep this tab open</span></div>
-              </div>
-            </div>
-          </div>
+        {(processing || completionVisible) && (
+          <aside
+            className={`background-job-dock ${completionVisible && !processing ? "is-complete" : ""}`}
+            role="status"
+            aria-live="polite"
+          >
+            <span className="job-orb" aria-hidden="true">
+              {processing ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}
+            </span>
+            <span className="job-copy">
+              <small>{processing ? "AURORA WORKING IN BACKGROUND" : "AURORA ENHANCEMENT READY"}</small>
+              <strong>{processing ? visibleProcessingLabel : "Your result is ready"}</strong>
+              <span>{processing ? `${formatTime(elapsed)} elapsed · you can continue browsing` : "Review, fine-tune or download the finished image."}</span>
+            </span>
+            {processing ? (
+              <span className="job-progress" aria-hidden="true">
+                <i style={{ width: `${Math.min(92, 14 + processingStage * 24)}%` }} />
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  document.getElementById("result")?.scrollIntoView({ behavior: "smooth" });
+                  setCompletionVisible(false);
+                }}
+              >
+                View result <ArrowDown size={14} />
+              </button>
+            )}
+            <button
+              className="job-dismiss"
+              type="button"
+              onClick={() => setCompletionVisible(false)}
+              aria-label="Dismiss notification"
+              disabled={processing}
+            >
+              <X size={13} />
+            </button>
+          </aside>
         )}
 
         <section className="studio-panel" aria-label="Enhancement studio">
@@ -584,7 +732,7 @@ function App() {
               <p>Upload exposures and viewpoints freely. AuroraAI creates one best-area composite per fixed camera scene.</p>
             </div>
             {files.length > 0 && (
-              <button className="text-button" type="button" onClick={clearAll}>
+              <button className="text-button" type="button" onClick={clearAll} disabled={processing}>
                 <Trash2 size={14} /> Clear session
               </button>
             )}
@@ -592,7 +740,7 @@ function App() {
 
           <div
             className={`drop-zone ${dragging ? "is-dragging" : ""} ${files.length ? "has-files" : ""}`}
-            onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+            onDragEnter={(event) => { event.preventDefault(); if (!processing) setDragging(true); }}
             onDragOver={(event) => event.preventDefault()}
             onDragLeave={(event) => {
               if (event.currentTarget === event.target) setDragging(false);
@@ -600,7 +748,7 @@ function App() {
             onDrop={(event: DragEvent<HTMLDivElement>) => {
               event.preventDefault();
               setDragging(false);
-              addFiles(Array.from(event.dataTransfer.files));
+              if (!processing) addFiles(Array.from(event.dataTransfer.files));
             }}
           >
             <input
@@ -608,6 +756,7 @@ function App() {
               type="file"
               accept={ACCEPTED_TYPES}
               multiple
+              disabled={processing}
               onChange={(event: ChangeEvent<HTMLInputElement>) => {
                 addFiles(Array.from(event.target.files ?? []));
                 event.target.value = "";
@@ -616,6 +765,7 @@ function App() {
             <button
               className="drop-action"
               type="button"
+              disabled={processing}
               onClick={() => fileInput.current?.click()}
               aria-label="Choose images"
             >
@@ -653,13 +803,13 @@ function App() {
                         {item.previewState === "loading" ? "Preparing preview…" : formatBytes(item.file.size)}
                       </span>
                     </div>
-                    <button type="button" onClick={() => removeFile(item.id)} aria-label={`Remove ${item.file.name}`}>
+                    <button type="button" disabled={processing} onClick={() => removeFile(item.id)} aria-label={`Remove ${item.file.name}`}>
                       <X size={15} />
                     </button>
                   </article>
                 ))}
                 {files.length < MAX_FILES && (
-                  <button className="add-more" type="button" onClick={() => fileInput.current?.click()}>
+                  <button className="add-more" type="button" disabled={processing} onClick={() => fileInput.current?.click()}>
                     <ImagePlus size={19} /><span>Add frame</span>
                   </button>
                 )}
@@ -683,7 +833,7 @@ function App() {
             >
               {processing ? <LoaderCircle className="spin" size={19} /> : <WandSparkles size={19} />}
               <span>
-                <strong>{processing ? (processingStageLabel ?? processingLabel) : "Enhance with AuroraAI"}</strong>
+                <strong>{processing ? visibleProcessingLabel : "Enhance with AuroraAI"}</strong>
                 <small>
                   {processing
                     ? `${formatTime(elapsed)} elapsed · keep this tab open`
@@ -697,7 +847,7 @@ function App() {
           </div>
         </section>
 
-        {activeImageUrl && activeOriginalUrl && (
+        {session && activeImageUrl && activeOriginalUrl && (
           <section className="result-section" id="result">
             <div className="result-heading">
               <div>

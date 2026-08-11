@@ -24,6 +24,12 @@ export type EnhanceResponse = {
   room_groups?: number;
   grouping_model?: string;
   results?: RoomResult[];
+  job_id?: string;
+};
+
+export type LockedEnhanceResponse = {
+  status: "locked";
+  job_id: string;
 };
 
 export type RoomResult = {
@@ -70,6 +76,7 @@ type EnhancementJobStatus = {
   stage?: string;
   detail?: string;
   result?: EnhanceResponse;
+  result_locked?: boolean;
 };
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -119,13 +126,15 @@ export async function enhanceImages(
   files: File[],
   strength: number,
   onStage?: (stage: string) => void,
-): Promise<EnhanceResponse> {
+  accessToken?: string,
+): Promise<EnhanceResponse | LockedEnhanceResponse> {
   const data = new FormData();
   files.forEach((file) => data.append("files", file));
   data.append("strength", String(strength));
 
   const response = await fetch(`${API_URL}/enhance-jobs`, {
     method: "POST",
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
     body: data,
   });
   const job = await readJson<EnhancementJobStart>(response);
@@ -147,15 +156,35 @@ export async function enhanceImages(
     await new Promise((resolve) => window.setTimeout(resolve, 2000));
     const statusResponse = await fetch(
       `${API_URL}/enhance-jobs/${job.job_id}?t=${Date.now()}`,
-      { cache: "no-store" },
+      {
+        cache: "no-store",
+        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+      },
     );
     const status = await readJson<EnhancementJobStatus>(statusResponse);
     if (status.stage) onStage?.(status.stage);
-    if (status.status === "completed" && status.result) return status.result;
+    if (status.status === "completed" && status.result) {
+      return { ...status.result, job_id: job.job_id };
+    }
+    if (status.status === "completed" && status.result_locked) {
+      return { status: "locked", job_id: job.job_id };
+    }
     if (status.status === "failed") {
       throw new Error(status.detail || "Image enhancement failed.");
     }
   }
 
   throw new Error("Enhancement is still running after 30 minutes. Please try again.");
+}
+
+export async function claimEnhancementJob(
+  jobId: string,
+  accessToken: string,
+): Promise<EnhanceResponse> {
+  const response = await fetch(`${API_URL}/enhance-jobs/${jobId}/claim`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const payload = await readJson<{ status: "success"; result: EnhanceResponse }>(response);
+  return { ...payload.result, job_id: jobId };
 }
