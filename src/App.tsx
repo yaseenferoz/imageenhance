@@ -46,6 +46,7 @@ import {
   claimEnhancementJob,
   createRawPreview,
   enhanceImages,
+  queueEnhancementImages,
   type EnhanceResponse,
   type RoomResult,
 } from "./api";
@@ -213,6 +214,10 @@ function App() {
   const [pendingJobId, setPendingJobId] = useState<string | null>(() =>
     window.sessionStorage.getItem("auroraai-pending-job"),
   );
+  const pipelinePendingCount = accountJobs.filter(
+    (job) => job.status === "queued" || job.status === "processing",
+  ).length;
+  const previousPipelinePending = useRef(0);
 
   const roomResults = result?.results ?? [];
   const activeRoom: RoomResult | null = roomResults[activeRoomIndex] ?? null;
@@ -282,6 +287,25 @@ function App() {
     );
     return () => window.clearInterval(timer);
   }, [processing]);
+
+  useEffect(() => {
+    if (
+      previousPipelinePending.current > 0
+      && pipelinePendingCount === 0
+      && accountJobs[0]?.status === "completed"
+    ) {
+      const latestResult = accountJobs.find((job) => job.status === "completed" && job.result)?.result;
+      if (latestResult) {
+        setResult(latestResult);
+        setOriginalUrl(latestResult.original_preview_url ?? null);
+        setActiveRoomIndex(0);
+        setViewMode("enhanced");
+        setEditorSettings(DEFAULT_EDITOR_SETTINGS);
+      }
+      setCompletionVisible(true);
+    }
+    previousPipelinePending.current = pipelinePendingCount;
+  }, [accountJobs, pipelinePendingCount]);
 
   useEffect(
     () => () => {
@@ -443,7 +467,7 @@ function App() {
   const runEnhancement = async () => {
     if (!files.length || previewLoading) return;
     setError(null);
-    setResult(null);
+    if (!session) setResult(null);
     setActiveRoomIndex(0);
     setActiveDirectionId(null);
     setCompletionVisible(false);
@@ -451,11 +475,23 @@ function App() {
     setProcessing(true);
 
     try {
+      const sourceFiles = files.map((item) => item.file);
+      if (session) {
+        await queueEnhancementImages(sourceFiles, strength, session.access_token);
+        filesRef.current.forEach((item) => {
+          if (item.objectUrl && item.preview) URL.revokeObjectURL(item.preview);
+        });
+        filesRef.current = [];
+        setFiles([]);
+        if (fileInput.current) fileInput.current.value = "";
+        await refreshAccountJobs();
+        return;
+      }
       const response = await enhanceImages(
-        files.map((item) => item.file),
+        sourceFiles,
         strength,
         setProcessingStageLabel,
-        session?.access_token,
+        undefined,
       );
       if (response.status === "locked") {
         window.sessionStorage.setItem("auroraai-pending-job", response.job_id);
@@ -497,11 +533,14 @@ function App() {
   }, [session]);
 
   useEffect(() => {
-    if (!session || (!accountOpen && !processing)) return;
+    if (!session || (!accountOpen && !processing && pipelinePendingCount === 0)) return;
     void refreshAccountJobs();
-    const timer = window.setInterval(() => void refreshAccountJobs(), processing ? 3000 : 8000);
+    const timer = window.setInterval(
+      () => void refreshAccountJobs(),
+      processing || pipelinePendingCount > 0 ? 3000 : 8000,
+    );
     return () => window.clearInterval(timer);
-  }, [accountOpen, processing, refreshAccountJobs, session]);
+  }, [accountOpen, pipelinePendingCount, processing, refreshAccountJobs, session]);
 
   const beginSignIn = async () => {
     try {
@@ -623,6 +662,8 @@ function App() {
   const processingStage = elapsed < 8 ? 0 : elapsed < 28 ? 1 : elapsed < 55 ? 2 : 3;
   const visibleProcessingLabel =
     elapsed < 8 && processingStageLabel ? processingStageLabel : processingLabel;
+  const pipelineActive = Boolean(session && pipelinePendingCount > 0 && !processing);
+  const backgroundWorkActive = processing || pipelineActive;
 
   return (
     <div className="app-shell">
@@ -683,23 +724,24 @@ function App() {
           </div>
         </section>
 
-        {(processing || completionVisible) && (
+        {(backgroundWorkActive || completionVisible) && (
           <aside
-            className={`background-job-dock ${completionVisible && !processing ? "is-complete" : ""}`}
+            className={`background-job-dock ${completionVisible && !backgroundWorkActive ? "is-complete" : ""} ${pipelineActive ? "has-pipeline" : ""}`}
             role="status"
             aria-live="polite"
+            onClick={() => { if (pipelineActive) setAccountOpen(true); }}
           >
             <span className="job-orb" aria-hidden="true">
-              {processing ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}
+              {backgroundWorkActive ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}
             </span>
             <span className="job-copy">
-              <small>{processing ? "AURORA WORKING IN BACKGROUND" : "AURORA ENHANCEMENT READY"}</small>
-              <strong>{processing ? visibleProcessingLabel : "Your result is ready"}</strong>
-              <span>{processing ? `${formatTime(elapsed)} elapsed · you can continue browsing` : "Review, fine-tune or download the finished image."}</span>
+              <small>{processing ? "UPLOADING TO AURORA" : pipelineActive ? "AURORA ACCOUNT PIPELINE" : "AURORA ENHANCEMENT READY"}</small>
+              <strong>{processing ? visibleProcessingLabel : pipelineActive ? `${pipelinePendingCount} ${pipelinePendingCount === 1 ? "request" : "requests"} queued or processing` : "Your result is ready"}</strong>
+              <span>{processing ? `${formatTime(elapsed)} elapsed` : pipelineActive ? "Requests run one at a time · click to view activity" : "Review, fine-tune or download the finished image."}</span>
             </span>
-            {processing ? (
+            {backgroundWorkActive ? (
               <span className="job-progress" aria-hidden="true">
-                <i style={{ width: `${Math.min(92, 14 + processingStage * 24)}%` }} />
+                <i className={pipelineActive ? "pipeline-pulse" : ""} style={{ width: pipelineActive ? "38%" : `${Math.min(92, 14 + processingStage * 24)}%` }} />
               </span>
             ) : (
               <button
@@ -717,7 +759,7 @@ function App() {
               type="button"
               onClick={() => setCompletionVisible(false)}
               aria-label="Dismiss notification"
-              disabled={processing}
+              disabled={backgroundWorkActive}
             >
               <X size={13} />
             </button>

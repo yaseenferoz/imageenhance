@@ -3,6 +3,7 @@ import type { EnhanceResponse } from "./api";
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL?.trim();
 const supabasePublishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim();
+const configuredSiteUrl = import.meta.env.VITE_SITE_URL?.trim().replace(/\/$/, "");
 
 export const authConfigured = Boolean(supabaseUrl && supabasePublishableKey);
 export const supabase = authConfigured
@@ -31,7 +32,7 @@ export async function signInWithGoogle() {
   const { error } = await supabase.auth.signInWithOAuth({
     provider: "google",
     options: {
-      redirectTo: window.location.origin,
+      redirectTo: configuredSiteUrl || window.location.origin,
     },
   });
   if (error) throw new Error(error.message);

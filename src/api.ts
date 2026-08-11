@@ -122,12 +122,11 @@ export async function createRawPreview(file: File): Promise<string> {
   return payload.preview_url;
 }
 
-export async function enhanceImages(
+export async function queueEnhancementImages(
   files: File[],
   strength: number,
-  onStage?: (stage: string) => void,
   accessToken?: string,
-): Promise<EnhanceResponse | LockedEnhanceResponse> {
+): Promise<string> {
   const data = new FormData();
   files.forEach((file) => data.append("files", file));
   data.append("strength", String(strength));
@@ -138,6 +137,16 @@ export async function enhanceImages(
     body: data,
   });
   const job = await readJson<EnhancementJobStart>(response);
+  return job.job_id;
+}
+
+export async function enhanceImages(
+  files: File[],
+  strength: number,
+  onStage?: (stage: string) => void,
+  accessToken?: string,
+): Promise<EnhanceResponse | LockedEnhanceResponse> {
+  const jobId = await queueEnhancementImages(files, strength, accessToken);
   const hasRawInput = files.some((file) => {
     const extension = file.name.toLowerCase().split(".").pop();
     return extension !== undefined && [
@@ -155,7 +164,7 @@ export async function enhanceImages(
   for (let attempt = 0; attempt < 900; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 2000));
     const statusResponse = await fetch(
-      `${API_URL}/enhance-jobs/${job.job_id}?t=${Date.now()}`,
+      `${API_URL}/enhance-jobs/${jobId}?t=${Date.now()}`,
       {
         cache: "no-store",
         headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
@@ -164,10 +173,10 @@ export async function enhanceImages(
     const status = await readJson<EnhancementJobStatus>(statusResponse);
     if (status.stage) onStage?.(status.stage);
     if (status.status === "completed" && status.result) {
-      return { ...status.result, job_id: job.job_id };
+      return { ...status.result, job_id: jobId };
     }
     if (status.status === "completed" && status.result_locked) {
-      return { status: "locked", job_id: job.job_id };
+      return { status: "locked", job_id: jobId };
     }
     if (status.status === "failed") {
       throw new Error(status.detail || "Image enhancement failed.");
