@@ -80,10 +80,31 @@ type EnhancementJobStatus = {
 };
 
 async function readJson<T>(response: Response): Promise<T> {
-  const payload = (await response.json()) as T & {
+  const body = await response.text();
+
+  if (!body.trim()) {
+    throw new Error(
+      response.ok
+        ? "The backend connection ended before it returned a result. The image worker may have restarted; please retry the job."
+        : `The backend returned an empty response (${response.status}). Please check that the API and tunnel are running.`,
+    );
+  }
+
+  let payload: T & {
     detail?: string;
     message?: string;
   };
+
+  try {
+    payload = JSON.parse(body) as T & {
+      detail?: string;
+      message?: string;
+    };
+  } catch {
+    throw new Error(
+      `The backend returned an invalid response (${response.status}). The image worker or tunnel may have disconnected.`,
+    );
+  }
 
   if (!response.ok) {
     throw new Error(
@@ -145,8 +166,10 @@ export async function enhanceImages(
   strength: number,
   onStage?: (stage: string) => void,
   accessToken?: string,
+  onJobCreated?: (jobId: string) => void,
 ): Promise<EnhanceResponse | LockedEnhanceResponse> {
   const jobId = await queueEnhancementImages(files, strength, accessToken);
+  onJobCreated?.(jobId);
   const hasRawInput = files.some((file) => {
     const extension = file.name.toLowerCase().split(".").pop();
     return extension !== undefined && [

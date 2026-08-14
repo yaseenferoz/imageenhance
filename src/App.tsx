@@ -211,9 +211,15 @@ function App() {
   const [accountOpen, setAccountOpen] = useState(false);
   const [accountJobs, setAccountJobs] = useState<AccountJob[]>([]);
   const [accountJobsLoading, setAccountJobsLoading] = useState(false);
-  const [pendingJobId, setPendingJobId] = useState<string | null>(() =>
-    window.sessionStorage.getItem("auroraai-pending-job"),
-  );
+  const [pendingJobId, setPendingJobId] = useState<string | null>(() => {
+    const durableJob = window.localStorage.getItem("auroraai-pending-job");
+    const legacyJob = window.sessionStorage.getItem("auroraai-pending-job");
+    if (!durableJob && legacyJob) {
+      window.localStorage.setItem("auroraai-pending-job", legacyJob);
+      window.sessionStorage.removeItem("auroraai-pending-job");
+    }
+    return durableJob || legacyJob;
+  });
   const pipelinePendingCount = accountJobs.filter(
     (job) => job.status === "queued" || job.status === "processing",
   ).length;
@@ -244,7 +250,21 @@ function App() {
     if (!session || !pendingJobId) return;
     let active = true;
     setAccountJobsLoading(true);
-    void claimEnhancementJob(pendingJobId, session.access_token)
+    const claimWhenReady = async () => {
+      for (let attempt = 0; attempt < 900; attempt += 1) {
+        try {
+          return await claimEnhancementJob(pendingJobId, session.access_token);
+        } catch (claimError) {
+          const message = claimError instanceof Error ? claimError.message : "";
+          if (!message.toLowerCase().includes("not ready yet")) throw claimError;
+          if (!active) throw new Error("Claim cancelled");
+          setProcessingStageLabel("Your enhancement is still finishing");
+          await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        }
+      }
+      throw new Error("Enhancement is still processing. It remains saved to your account.");
+    };
+    void claimWhenReady()
       .then((claimedResult) => {
         if (!active) return;
         setResult(claimedResult);
@@ -252,6 +272,7 @@ function App() {
         setActiveRoomIndex(0);
         setViewMode("enhanced");
         setEditorSettings(DEFAULT_EDITOR_SETTINGS);
+        window.localStorage.removeItem("auroraai-pending-job");
         window.sessionStorage.removeItem("auroraai-pending-job");
         setPendingJobId(null);
         setAccountOpen(false);
@@ -492,9 +513,13 @@ function App() {
         strength,
         setProcessingStageLabel,
         undefined,
+        (jobId) => {
+          window.localStorage.setItem("auroraai-pending-job", jobId);
+          setPendingJobId(jobId);
+        },
       );
       if (response.status === "locked") {
-        window.sessionStorage.setItem("auroraai-pending-job", response.job_id);
+        window.localStorage.setItem("auroraai-pending-job", response.job_id);
         setPendingJobId(response.job_id);
         setAccountOpen(true);
         setCompletionVisible(false);
